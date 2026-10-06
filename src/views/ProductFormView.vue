@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import api from '../lib/api';
 
@@ -62,13 +62,56 @@ function removeCharacteristic(idx: number) {
   characteristics.value.splice(idx, 1);
 }
 
-async function onFilesSelected(e: Event) {
-  const input = e.target as HTMLInputElement;
-  if (!input.files?.length) return;
+// ============ IMÁGENES ============
+// Celular/tablet: el input con `capture` abre la cámara directamente.
+// PC: se usa la webcam vía getUserMedia (si hay), o se eligen archivos de una carpeta.
+const isTouchDevice = window.matchMedia('(pointer: coarse)').matches;
+const fileInput = ref<HTMLInputElement | null>(null);
+const cameraInput = ref<HTMLInputElement | null>(null);
+const dragging = ref(false);
+
+const webcamOpen = ref(false);
+const webcamVideo = ref<HTMLVideoElement | null>(null);
+let webcamStream: MediaStream | null = null;
+
+const MAX_DIMENSION = 1600;
+const JPEG_QUALITY = 0.85;
+
+// Reduce fotos grandes (las del celular suelen pesar 3-10MB) y las pasa a JPEG,
+// lo que además convierte formatos como HEIC cuando el navegador puede leerlos.
+async function compressImage(file: File): Promise<File> {
+  if (file.type === 'image/gif') return file;
+  try {
+    const bitmap = await createImageBitmap(file);
+    const scale = Math.min(1, MAX_DIMENSION / Math.max(bitmap.width, bitmap.height));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(bitmap.width * scale);
+    canvas.height = Math.round(bitmap.height * scale);
+    canvas.getContext('2d')!.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    bitmap.close();
+    const blob = await new Promise<Blob | null>((resolve) =>
+      canvas.toBlob(resolve, 'image/jpeg', JPEG_QUALITY),
+    );
+    if (!blob || (scale === 1 && blob.size >= file.size && file.type !== 'image/heic')) return file;
+    const name = file.name.replace(/\.[^.]+$/, '') + '.jpg';
+    return new File([blob], name, { type: 'image/jpeg' });
+  } catch {
+    return file;
+  }
+}
+
+async function uploadFiles(files: File[]) {
+  const imagesOnly = files.filter((f) => f.type.startsWith('image/') || /\.(heic|heif)$/i.test(f.name));
+  if (!imagesOnly.length) {
+    error.value = 'Solo se pueden subir imágenes';
+    return;
+  }
+  error.value = '';
   uploading.value = true;
   try {
+    const prepared = await Promise.all(imagesOnly.map(compressImage));
     const fd = new FormData();
-    Array.from(input.files).forEach((f) => fd.append('files', f));
+    prepared.forEach((f) => fd.append('files', f));
     const { data } = await api.post('/uploads/images', fd, {
       headers: { 'Content-Type': 'multipart/form-data' },
     });
@@ -79,9 +122,58 @@ async function onFilesSelected(e: Event) {
     error.value = e.response?.data?.message ?? 'Error al subir imágenes';
   } finally {
     uploading.value = false;
-    input.value = '';
   }
 }
+
+function onFilesSelected(e: Event) {
+  const input = e.target as HTMLInputElement;
+  if (input.files?.length) uploadFiles(Array.from(input.files));
+  input.value = '';
+}
+
+function onDrop(e: DragEvent) {
+  dragging.value = false;
+  if (uploading.value) return;
+  const files = Array.from(e.dataTransfer?.files ?? []);
+  if (files.length) uploadFiles(files);
+}
+
+async function takePhoto() {
+  if (isTouchDevice || !navigator.mediaDevices?.getUserMedia) {
+    cameraInput.value?.click();
+    return;
+  }
+  try {
+    webcamStream = await navigator.mediaDevices.getUserMedia({ video: true });
+    webcamOpen.value = true;
+    await nextTick();
+    if (webcamVideo.value) webcamVideo.value.srcObject = webcamStream;
+  } catch {
+    error.value = 'No se encontró una cámara o no se dio permiso. Podés elegir las imágenes desde una carpeta.';
+  }
+}
+
+function closeWebcam() {
+  webcamStream?.getTracks().forEach((t) => t.stop());
+  webcamStream = null;
+  webcamOpen.value = false;
+}
+
+async function captureWebcam() {
+  const video = webcamVideo.value;
+  if (!video || !video.videoWidth) return;
+  const canvas = document.createElement('canvas');
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  canvas.getContext('2d')!.drawImage(video, 0, 0);
+  const blob = await new Promise<Blob | null>((resolve) =>
+    canvas.toBlob(resolve, 'image/jpeg', JPEG_QUALITY),
+  );
+  closeWebcam();
+  if (blob) uploadFiles([new File([blob], `foto-${Date.now()}.jpg`, { type: 'image/jpeg' })]);
+}
+
+onBeforeUnmount(closeWebcam);
 
 function removeImage(idx: number) {
   const wasPrimary = images.value[idx].isPrimary;
@@ -210,11 +302,39 @@ async function applyStockAdjust() {
 
       <div class="field">
         <label>Imágenes</label>
-        <input type="file" multiple accept="image/*" @change="onFilesSelected" :disabled="uploading" />
-        <p v-if="uploading" class="muted">Subiendo imágenes...</p>
+        <div
+          class="dropzone"
+          :class="{ dragging }"
+          @dragover.prevent="dragging = true"
+          @dragleave.prevent="dragging = false"
+          @drop.prevent="onDrop"
+        >
+          <div class="flex gap-8 upload-buttons">
+            <button type="button" class="btn btn-secondary" :disabled="uploading" @click="fileInput?.click()">
+              📁 {{ isTouchDevice ? 'Elegir de la galería' : 'Elegir desde la computadora' }}
+            </button>
+            <button type="button" class="btn btn-secondary" :disabled="uploading" @click="takePhoto">
+              📷 Sacar foto
+            </button>
+          </div>
+          <p v-if="!isTouchDevice" class="muted dropzone-hint">o arrastrá las imágenes acá</p>
+          <p v-if="uploading" class="muted">Subiendo imágenes...</p>
+        </div>
+        <input ref="fileInput" type="file" multiple accept="image/*" hidden @change="onFilesSelected" />
+        <input ref="cameraInput" type="file" accept="image/*" capture="environment" hidden @change="onFilesSelected" />
+
+        <div v-if="webcamOpen" class="webcam-overlay" @click.self="closeWebcam">
+          <div class="card webcam-box">
+            <video ref="webcamVideo" autoplay playsinline muted></video>
+            <div class="flex gap-8 mt-16" style="justify-content: flex-end;">
+              <button type="button" class="btn btn-secondary" @click="closeWebcam">Cancelar</button>
+              <button type="button" class="btn btn-primary" @click="captureWebcam">Capturar</button>
+            </div>
+          </div>
+        </div>
         <div class="image-grid mt-16">
           <div v-for="(img, idx) in images" :key="img.url" class="image-item" :class="{ primary: img.isPrimary }">
-            <img :src="apiOrigin + img.url" />
+            <img :src="img.url.startsWith('http') ? img.url : apiOrigin + img.url" />
             <div class="image-actions">
               <button type="button" class="btn btn-secondary btn-sm" @click="setPrimary(idx)" :disabled="img.isPrimary">
                 {{ img.isPrimary ? 'Principal' : 'Marcar principal' }}
@@ -265,4 +385,14 @@ async function applyStockAdjust() {
 .image-item.primary { border-color: var(--primary); }
 .image-item img { width: 100%; height: 90px; object-fit: cover; border-radius: 6px; }
 .image-actions { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+.dropzone { border: 2px dashed var(--border); border-radius: 8px; padding: 16px; text-align: center; }
+.dropzone.dragging { border-color: var(--primary); }
+.dropzone-hint { margin: 8px 0 0; }
+.upload-buttons { justify-content: center; flex-wrap: wrap; }
+.webcam-overlay {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, 0.6);
+  display: flex; align-items: center; justify-content: center; z-index: 100; padding: 16px;
+}
+.webcam-box { width: 100%; max-width: 640px; }
+.webcam-box video { width: 100%; border-radius: 6px; background: #000; }
 </style>
